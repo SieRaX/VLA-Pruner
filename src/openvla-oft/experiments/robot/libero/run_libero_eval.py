@@ -140,8 +140,13 @@ class GenerateConfig:
     # Utils
     #################################################################################################################
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
+    max_steps_cap: Optional[int] = None              # Cap on env steps per episode (for short smoke runs)
     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
     save_rollout_videos: bool = False               # Save per-episode MP4s; disabling avoids ffmpeg fork/native crashes
+
+    save_ranking_viz: bool = False                   # Dump per-query patch importance scores (VLA-Pruner only) as npz
+    ranking_viz_max_episodes: int = 10               # Cap on episodes (across the whole run) that get ranking dumps
+    ranking_viz_dir: Optional[str] = None            # Dump dir; default <local_log_dir>/ranking_viz/<run_id>
 
     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
     wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
@@ -355,6 +360,7 @@ def run_episode(
     noisy_action_projector=None,
     initial_state=None,
     log_file=None,
+    collect_ranking=False,
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -387,11 +393,14 @@ def run_episode(
     
     
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
+    if cfg.max_steps_cap is not None:
+        max_steps = min(max_steps, cfg.max_steps_cap)
     episode_time = 0
     episode_step = 0
     episode_task_static_tokens_primary = 0
     episode_task_static_tokens_wrist = 0
-    
+    ranking_dumps = []
+
     # Run episode
     success = False
     try:
@@ -433,10 +442,15 @@ def run_episode(
                 episode_step += 1
                 episode_task_static_tokens_primary += metrics['num_static_tokens_primary']
                 episode_task_static_tokens_wrist += metrics['num_static_tokens_wrist']
+                ranking_dump = metrics.pop("ranking_dump", None)
+                if collect_ranking and ranking_dump is not None:
+                    ranking_dumps.append((episode_step, t, ranking_dump))
                 
                 action_queue.extend(actions)
+                # result_image is a single [input|pruned|input|pruned] frame across views
                 replay_images_heatmap.append(result_image[0])
-                replay_images_wrist_heatmap.append(result_image[1])
+                if len(result_image) > 1:
+                    replay_images_wrist_heatmap.append(result_image[1])
                 prev_img = img
                 prev_img_wrist = img_wrist
 
@@ -461,10 +475,37 @@ def run_episode(
         "episode_time": episode_time,
         "episode_step": episode_step,
         "episode_task_static_tokens_primary": episode_task_static_tokens_primary,
-        "episode_task_static_tokens_wrist": episode_task_static_tokens_wrist
+        "episode_task_static_tokens_wrist": episode_task_static_tokens_wrist,
+        "ranking_dumps": ranking_dumps,
     }
 
     return success, replay_images_heatmap, replay_images_wrist_heatmap, eposode_metrics
+
+
+def save_ranking_dumps(cfg, dumps, task_id, task_description, episode_num, success, log_file=None):
+    """Writes one npz per model query with the per-patch importance scores of that step."""
+    label = "success" if success else "failure"
+    ep_dir = os.path.join(cfg.ranking_viz_dir, f"ep{episode_num:03d}_task{task_id:02d}_{label}")
+    os.makedirs(ep_dir, exist_ok=True)
+    with open(os.path.join(ep_dir, "meta.json"), "w") as f:
+        json.dump(
+            {
+                "task_id": task_id,
+                "task_description": task_description,
+                "episode": episode_num,
+                "success": bool(success),
+            },
+            f,
+            indent=2,
+        )
+    for query_idx, env_step, dump in dumps:
+        np.savez_compressed(
+            os.path.join(ep_dir, f"step{env_step:03d}.npz"),
+            query_idx=np.int64(query_idx),
+            env_step=np.int64(env_step),
+            **dump,
+        )
+    log_message(f"Saved {len(dumps)} ranking dumps to {ep_dir}", log_file)
 
 
 def run_task(
@@ -520,6 +561,8 @@ def run_task(
 
         log_message(f"Starting episode {task_episodes + 1}...", log_file)
 
+        collect_ranking = bool(cfg.save_ranking_viz) and total_episodes < cfg.ranking_viz_max_episodes
+
         # Run episode
         success, replay_images, replay_images_wrist, eposode_metrics = run_episode(
             cfg,
@@ -533,6 +576,7 @@ def run_task(
             noisy_action_projector,
             initial_state,
             log_file,
+            collect_ranking=collect_ranking,
         )
         
         total_steps += eposode_metrics["episode_step"]
@@ -549,6 +593,17 @@ def run_task(
             task_successes += 1
             total_successes += 1
 
+        if collect_ranking and eposode_metrics["ranking_dumps"]:
+            save_ranking_dumps(
+                cfg,
+                eposode_metrics["ranking_dumps"],
+                task_id,
+                task_description,
+                total_episodes,
+                success,
+                log_file,
+            )
+
         if cfg.save_rollout_videos:
             save_rollout_video(
                 replay_images,
@@ -556,16 +611,17 @@ def run_task(
                 success=success,
                 task_description=task_description,
                 log_file=log_file,
-                view="primary",
+                view="pruning",
             )
-            save_rollout_video(
-                replay_images_wrist,
-                total_episodes,
-                success=success,
-                task_description=task_description,
-                log_file=log_file,
-                view="wrist",
-            )
+            if len(replay_images_wrist) > 0:
+                save_rollout_video(
+                    replay_images_wrist,
+                    total_episodes,
+                    success=success,
+                    task_description=task_description,
+                    log_file=log_file,
+                    view="wrist",
+                )
 
         # Log results
         log_message(f"Success: {success}", log_file)
@@ -611,6 +667,9 @@ def eval_libero(cfg: GenerateConfig) -> float:
     # Setup logging
     log_file, local_log_filepath, run_id = setup_logging(cfg)
     log_eval_config(cfg, log_file)
+
+    if cfg.save_ranking_viz and cfg.ranking_viz_dir is None:
+        cfg.ranking_viz_dir = os.path.join(cfg.local_log_dir, "ranking_viz", run_id)
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()

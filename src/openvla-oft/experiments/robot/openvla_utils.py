@@ -34,7 +34,12 @@ from prismatic.vla.constants import (
 )
 from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
 
-from .vla_cache_utils import find_static_patches, task_relevant_selection, get_layer_mask_schedule
+try:
+    from .vla_cache_utils import find_static_patches, task_relevant_selection, get_layer_mask_schedule
+except ImportError:
+    # vla_cache_utils was never committed upstream; these are only needed on the
+    # use_vla_cache=True path
+    find_static_patches = task_relevant_selection = get_layer_mask_schedule = None
 
 from transformers import DynamicCache
 
@@ -800,6 +805,81 @@ def prepare_images_for_vla(images: List[np.ndarray], cfg: Any) -> List[Image.Ima
     return processed_images
 
 
+def compose_pruning_frame(input_img, kept_patch_ids, grid_size=16, patch_size=14, separator_px=16):
+    """Builds a side-by-side [model input | pruned input] frame for one camera view.
+
+    The right pane blacks out every patch not in `kept_patch_ids` (per-view patch ids
+    in [0, grid_size**2), row-major over the model-input image). `kept_patch_ids=None`
+    means no pruning happened this query, so the right pane shows the full image.
+    separator_px=16 keeps pane offsets on multiples of 16 so the mp4 encoder does not
+    resample the frame and shift the patch grid.
+    """
+    left = np.asarray(input_img.convert("RGB") if isinstance(input_img, Image.Image) else input_img, dtype=np.uint8)
+    right = left.copy()
+    if kept_patch_ids is not None:
+        keep = np.zeros(grid_size * grid_size, dtype=bool)
+        ids = np.asarray(kept_patch_ids, dtype=np.int64).ravel()
+        keep[ids[(ids >= 0) & (ids < keep.size)]] = True
+        mask = np.kron(keep.reshape(grid_size, grid_size), np.ones((patch_size, patch_size), dtype=bool))
+        right[~mask] = 0
+    separator = np.full((left.shape[0], separator_px, 3), 255, dtype=np.uint8)
+    return np.concatenate([left, separator, right], axis=1)
+
+
+def split_kept_visual_patches(pruning_info, token_metadata, num_views):
+    """Maps this query's kept sequence indices to per-view patch-id arrays.
+
+    Returns a list of length `num_views`; an entry of None means "no pruning"
+    (also used when pruning_info is absent, e.g. temporal warm-up or baseline).
+    """
+    if not isinstance(pruning_info, dict) or pruning_info.get("kept_indices") is None:
+        return [None] * num_views
+    md = token_metadata if isinstance(token_metadata, dict) else {}
+    start = md.get("visual_token_start", 1)
+    per_img = md.get("num_patches_per_image", 256)
+    end = md.get("visual_token_end", start + per_img * num_views)
+    kept = torch.as_tensor(pruning_info["kept_indices"]).detach().cpu().numpy().ravel()
+    kept = kept[(kept >= start) & (kept < end)] - start
+    return [kept[kept // per_img == i] % per_img for i in range(num_views)]
+
+
+def build_ranking_dump(pruning_info, token_metadata, view_images, kept_per_view):
+    """Collects per-patch importance scores for offline ranking visualization.
+
+    Returns a dict of numpy arrays (npz-ready), or None when this query did no
+    scored VLA-Pruner pruning (temporal warm-up, baseline, or FastV mode).
+    """
+    if not isinstance(pruning_info, dict) or pruning_info.get("prefill_scores") is None:
+        return None
+
+    def _to_np(key):
+        val = pruning_info.get(key)
+        return val.detach().float().cpu().numpy() if torch.is_tensor(val) else None
+
+    md = token_metadata if isinstance(token_metadata, dict) else {}
+    images = []
+    for img in view_images:
+        if isinstance(img, Image.Image):
+            img = np.asarray(img.convert("RGB"))
+        images.append(np.asarray(img, dtype=np.uint8))
+
+    dump = {
+        "prefill_scores": _to_np("prefill_scores"),
+        "current_action_scores": _to_np("current_action_scores"),
+        "patches_per_image": np.int64(md.get("num_patches_per_image", 256)),
+        "images": np.stack(images),
+    }
+    # The score the selector actually used on the action side (temporally smoothed
+    # historical attention when use_temporal is on, else same as current_action_scores).
+    action_scores = _to_np("action_scores")
+    if action_scores is not None:
+        dump["action_scores"] = action_scores
+    for view_idx, kept in enumerate(kept_per_view):
+        if kept is not None:
+            dump[f"kept_view{view_idx}"] = np.asarray(kept, dtype=np.int64)
+    return {k: v for k, v in dump.items() if v is not None}
+
+
 def get_vla_action(
     cfg: Any,
     vla: torch.nn.Module,
@@ -833,6 +913,7 @@ def get_vla_action(
     all_images = [obs["full_image"]]
     if cfg.num_images_in_input > 1:
         all_images.extend([obs[k] for k in obs.keys() if "wrist" in k])
+    num_views = len(all_images)
 
     # Process images
     all_images = prepare_images_for_vla(all_images, cfg)
@@ -954,7 +1035,22 @@ def get_vla_action(
     
     # Extract subset of actions for open loop steps
     action_list = [action[i] for i in range(min(len(action), cfg.num_open_loop_steps))]
-    result_image = [np.array(image) for image in result_image]
+
+    # Build one [input | pruned | input | pruned] frame across camera views from
+    # this query's keep-set; kept=None (warm-up / no pruning) renders full images
+    pruning_info = last_caches.get("pruning_info") if isinstance(last_caches, dict) else None
+    token_metadata = last_caches.get("token_metadata") if isinstance(last_caches, dict) else None
+    kept_per_view = split_kept_visual_patches(pruning_info, token_metadata, num_views)
+    if getattr(cfg, "save_ranking_viz", False):
+        metrics["ranking_dump"] = build_ranking_dump(
+            pruning_info, token_metadata, result_image[:num_views], kept_per_view
+        )
+    panes = []
+    for view_idx, (img, kept) in enumerate(zip(result_image[:num_views], kept_per_view)):
+        if view_idx:
+            panes.append(np.full((OPENVLA_IMAGE_SIZE, 16, 3), 255, dtype=np.uint8))
+        panes.append(compose_pruning_frame(img, kept))
+    result_image = [np.concatenate(panes, axis=1)]
     return action_list, last_caches, result_image, metrics
 
 

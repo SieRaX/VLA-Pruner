@@ -1021,6 +1021,8 @@ class LlamaModel(LlamaPreTrainedModel):
         if use_vla_pruner:
             score_info = {}
             current_action_scores = []
+            all_prefill_scores = []
+            all_action_scores = []
             for span_start, span_end in image_spans:
                 span_len = span_end - span_start
                 span_keep = int(round(span_len * (1.0 - prune_ratio)))
@@ -1031,11 +1033,19 @@ class LlamaModel(LlamaPreTrainedModel):
                 top_image_indices.append(span_indices)
                 if span_scores.get("current_action_scores") is not None:
                     current_action_scores.append(span_scores["current_action_scores"])
+                if span_scores.get("prefill_scores") is not None:
+                    all_prefill_scores.append(span_scores["prefill_scores"])
+                if span_scores.get("action_scores") is not None:
+                    all_action_scores.append(span_scores["action_scores"])
                 span_info.append((span_start, span_end, span_keep))
             top_image_indices = torch.cat(top_image_indices).sort().values
             score_info["image_spans"] = span_info
             if current_action_scores:
                 score_info["current_action_scores"] = torch.cat(current_action_scores).detach()
+            if all_prefill_scores:
+                score_info["prefill_scores"] = torch.cat(all_prefill_scores).detach()
+            if all_action_scores:
+                score_info["action_scores"] = torch.cat(all_action_scores).detach()
             mode = fastv_config.get("vla_pruner_mode", "semantic_action")
         else:
             span_scores = []
