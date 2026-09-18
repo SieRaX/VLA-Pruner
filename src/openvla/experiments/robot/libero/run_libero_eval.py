@@ -62,6 +62,15 @@ class GenerateConfig:
     #use test-to-vison attention or prefill attention
     use_text_vision_selection: bool = False
     use_prefil_attention: bool = False
+    # Oracle patch selection (greedy search vs full-patch action; upper bound on selection quality)
+    use_oracle_pruner: bool = False     # requires --use_fastv False
+    oracle_batch_size: int = 64         # candidate keep-sets per batched tail forward
+    oracle_warmup_queries: int = 3      # unpruned queries per episode (mirrors VLA-Pruner warm-up)
+    oracle_candidate_pool: int = 0      # 0 = pure greedy; M>0 restricts rounds >=2 to top-M singletons
+    oracle_selection: str = "greedy"    # "greedy" | "topk_singleton" (k best singleton patches, no greedy)
+    oracle_scoring: str = "surrogate"   # "surrogate" (teacher-forced, 1 fwd/chunk) | "exact" (free-running AR decode)
+    save_oracle_trace: bool = True      # per-query oracle traces (npz) under oracle_trace_dir
+    oracle_trace_dir: Optional[str] = None  # default <local_log_dir>/oracle_trace/<run_id>
     #################################################################################################################
     # Model-specific parameters
     #################################################################################################################
@@ -81,6 +90,7 @@ class GenerateConfig:
     # Utils
     #################################################################################################################
     run_id_note: Optional[str] = None                # Extra note to add in run ID for logging
+    max_steps_cap: Optional[int] = None              # Cap on env steps per episode (for short smoke runs)
     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
 
     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
@@ -97,6 +107,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     if "image_aug" in cfg.pretrained_checkpoint:
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
+    assert not (cfg.use_oracle_pruner and (cfg.use_fastv or cfg.sparsevlm)), "Oracle pruner requires --use_fastv False (and no SparseVLM)."
     # Set random seed
     set_seed_everywhere(cfg.seed)
     # [OpenVLA] Set action un-normalization key
@@ -179,6 +190,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 max_steps = 520  # longest training demo has 505 steps
             elif cfg.task_suite_name == "libero_90":
                 max_steps = 400  # longest training demo has 373 steps
+            if cfg.max_steps_cap is not None:
+                max_steps = min(max_steps, cfg.max_steps_cap)
             print(f"Starting episode {task_episodes+1}...")
             log_file.write(f"Starting episode {task_episodes+1}...\n")
             while t < max_steps + cfg.num_steps_wait:
@@ -230,7 +243,24 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         break
                     t += 1
             task_episodes += 1
+            if getattr(cfg, "use_oracle_pruner", False) and getattr(model, "_oracle_gaps", None):
+                gaps = np.array(model._oracle_gaps, dtype=np.float32)
+                msg = f"Oracle: {len(gaps)} searched queries, mean L1 gap {gaps.mean():.4f} (max {gaps.max():.4f})"
+                print(msg)
+                log_file.write(msg + "\n")
+                model._oracle_gaps = []
             total_episodes += 1
+            traces = getattr(model, "_oracle_traces", None)
+            if getattr(cfg, "use_oracle_pruner", False) and getattr(cfg, "save_oracle_trace", False) and traces:
+                if cfg.oracle_trace_dir is None:
+                    cfg.oracle_trace_dir = os.path.join(cfg.local_log_dir, "oracle_trace", run_id)
+                label = "success" if done else "failure"
+                ep_dir = os.path.join(cfg.oracle_trace_dir, f"ep{total_episodes:03d}_task{task_id:02d}_{label}")
+                os.makedirs(ep_dir, exist_ok=True)
+                for trace in traces:
+                    np.savez_compressed(os.path.join(ep_dir, f"query{int(trace['query_idx']):03d}.npz"), **trace)
+                log_file.write(f"Saved {len(traces)} oracle traces to {ep_dir}\n")
+                model._oracle_traces = []
 
             save_rollout_video(
                         replay_images_heatmap, total_episodes, success=done, task_description=task_description, log_file=log_file

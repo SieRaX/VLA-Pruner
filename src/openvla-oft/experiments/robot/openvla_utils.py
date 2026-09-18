@@ -385,6 +385,10 @@ def _configure_attention_pruning(vla: torch.nn.Module, cfg: Any) -> None:
         obj.vla_pruner_semantic_weight = float(getattr(cfg, "vla_pruner_semantic_weight", 0.5))
         obj.vla_pruner_action_weight = float(getattr(cfg, "vla_pruner_action_weight", 0.5))
         obj.vla_pruner_action_horizon = int(getattr(cfg, "vla_pruner_action_horizon", 0))
+        obj.use_oracle_pruner = bool(getattr(cfg, "use_oracle_pruner", False))
+        obj.oracle_candidate_pool = int(getattr(cfg, "oracle_candidate_pool", 0))
+        obj.oracle_batch_size = int(getattr(cfg, "oracle_batch_size", 128))
+        obj.oracle_warmup_queries = int(getattr(cfg, "oracle_warmup_queries", 3))
 
     if hasattr(vla, "av_hist"):
         vla.av_hist = deque(maxlen=av_hist_w)
@@ -1041,6 +1045,21 @@ def get_vla_action(
     pruning_info = last_caches.get("pruning_info") if isinstance(last_caches, dict) else None
     token_metadata = last_caches.get("token_metadata") if isinstance(last_caches, dict) else None
     kept_per_view = split_kept_visual_patches(pruning_info, token_metadata, num_views)
+    if (
+        isinstance(pruning_info, dict)
+        and pruning_info.get("mode") == "oracle"
+        and getattr(cfg, "save_oracle_trace", False)
+    ):
+        metrics["oracle_dump"] = {
+            "full_action": pruning_info["oracle_full_action"],
+            "oracle_action": pruning_info["oracle_action"],
+            "l1_gap": pruning_info["oracle_l1_gap"],
+            "round_scores": pruning_info["oracle_round_scores"],
+            "chosen": pruning_info["oracle_chosen"],
+            "chosen_view": pruning_info["oracle_chosen_view"],
+            "round0_scores": pruning_info["oracle_round0_scores"],
+            "kept_per_view": [k if k is not None else np.array([]) for k in kept_per_view],
+        }
     if getattr(cfg, "save_ranking_viz", False):
         metrics["ranking_dump"] = build_ranking_dump(
             pruning_info, token_metadata, result_image[:num_views], kept_per_view

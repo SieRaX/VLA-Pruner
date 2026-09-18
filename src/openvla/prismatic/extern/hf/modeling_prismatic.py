@@ -553,6 +553,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
     
     def reset_av_history(self):
         self.av_hist.clear()
+        self._oracle_query_count = 0
 
 
     def predict_action(
@@ -563,6 +564,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             input_ids = torch.cat(
                 (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
             )
+        if getattr(self, 'use_oracle_pruner', False):
+            return self._oracle_predict_action(input_ids, unnorm_key, **kwargs)
         if self.use_fastv or self.sparsevlm:
             historical_attention = None
             if self.use_temporal and len(self.av_hist) == self.av_hist.maxlen:
@@ -588,6 +591,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     'use_text_vision_selection': self.use_text_vision_selection,
                     'use_prefil_attention': self.use_prefil_attention,
                     'SparseVLM': self.sparsevlm,
+                    'forced_visual_indices': getattr(self, 'fastv_forced_visual_indices', None),
                 }
             else:
                 self.fastv_config = {
@@ -600,6 +604,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     'use_text_vision_selection': self.use_text_vision_selection,
                     'use_prefil_attention': self.use_prefil_attention,
                     'SparseVLM': self.sparsevlm,
+                    'forced_visual_indices': getattr(self, 'fastv_forced_visual_indices', None),
                 }
             results = self._generate_with_fastv_forward(
                 input_ids,
@@ -636,6 +641,233 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
         return actions, last_caches
 
+
+    # ---- Oracle patch selection: greedy search for the k visual patches whose pruned-input
+    # action is closest (mean L1, normalized action space) to the full-input action. -----------
+    def _oracle_multimodal_inputs(self, input_ids, pixel_values, attention_mask):
+        """Same multimodal embedding/mask construction as forward()'s multimodal branch."""
+        patch_features = self.vision_backbone(pixel_values)
+        projected = self.projector(patch_features)
+        input_embeddings = self.get_input_embeddings()(input_ids)
+        embeds = torch.cat([input_embeddings[:, :1, :], projected, input_embeddings[:, 1:, :]], dim=1)
+        mask = None
+        if attention_mask is not None:
+            patch_mask = torch.full(
+                (projected.shape[0], projected.shape[1]), fill_value=True,
+                dtype=attention_mask.dtype, device=attention_mask.device,
+            )
+            mask = torch.cat([attention_mask[:, :1], patch_mask, attention_mask[:, 1:]], dim=1)
+        return embeds, mask
+
+    def _oracle_tokens_to_normalized(self, token_ids):
+        """(N, action_dim) action token ids -> (N, action_dim) normalized actions (bin centers)."""
+        ids = token_ids.detach().cpu().numpy()
+        discretized = self.vocab_size - ids
+        discretized = np.clip(discretized - 1, a_min=0, a_max=self.bin_centers.shape[0] - 1)
+        return self.bin_centers[discretized]
+
+    def _oracle_center_lut(self, device):
+        """(256,) float32: expected normalized action contributed by each vocab slot of the
+        action-token slice [vocab_size-256, vocab_size). Slot pos <-> id vocab_size-256+pos <->
+        bin clip(255-pos, 0, n_bins-1), mirroring _oracle_tokens_to_normalized."""
+        lut = getattr(self, "_oracle_center_lut_cache", None)
+        if lut is None or lut.device != device:
+            n_bins = self.bin_centers.shape[0]
+            bins = np.clip(255 - np.arange(256), 0, n_bins - 1)
+            lut = torch.tensor(self.bin_centers[bins], device=device, dtype=torch.float32)
+            self._oracle_center_lut_cache = lut
+        return lut
+
+    def _oracle_generate_batch(self, boundary, prefix_cache, keep_rows, split_layer, n_tokens):
+        """Greedy-decode `n_tokens` action tokens for each candidate keep-set row -> (N, n_tokens)."""
+        logits, cache = self.language_model.oracle_tail_prefill(boundary, prefix_cache, keep_rows, split_layer)
+        tokens = [logits.argmax(dim=-1)]
+        for _ in range(n_tokens - 1):
+            logits = self.language_model.oracle_decode_step(tokens[-1].unsqueeze(1), cache)
+            tokens.append(logits.argmax(dim=-1))
+        del cache
+        return torch.stack(tokens, dim=1)
+
+    def _oracle_predict_action(self, input_ids, unnorm_key, **kwargs):
+        pixel_values = kwargs.get('pixel_values')
+        attention_mask = kwargs.get('attention_mask')
+        if pixel_values is None:
+            raise ValueError("Oracle pruner requires pixel_values.")
+        fastv_k = int(getattr(self, 'fastv_k', 3))
+        fastv_r = float(getattr(self, 'fastv_r', 0.5))
+        img_start = int(getattr(self, 'fastv_image_token_start_index', 1))
+        img_len = int(getattr(self, 'fastv_image_token_length', 256))
+        k_keep = max(0, min(img_len, int(round(img_len * (1.0 - fastv_r)))))
+        warmup = int(getattr(self, 'oracle_warmup_queries', 3))
+        batch_size = max(1, int(getattr(self, 'oracle_batch_size', 64)))
+        scoring_mode = str(getattr(self, 'oracle_scoring', 'surrogate'))
+        n_tokens = self.get_action_dim(unnorm_key)
+        self._oracle_query_count = int(getattr(self, '_oracle_query_count', 0)) + 1
+        forced = getattr(self, '_oracle_forced_keepset', None)
+        if not hasattr(self, '_oracle_gaps'):
+            self._oracle_gaps = []
+
+        with torch.no_grad():
+            embeds, mm_mask = self._oracle_multimodal_inputs(input_ids, pixel_values, attention_mask)
+            seq_len = embeds.shape[1]
+            device = embeds.device
+            boundary, prefix_cache = self.language_model.oracle_prefix_forward(embeds, mm_mask, fastv_k)
+
+            # Reference: full-patch action through the same machinery (all tokens kept).
+            all_rows = torch.arange(seq_len, device=device).unsqueeze(0)
+            full_tokens = self._oracle_generate_batch(boundary, prefix_cache, all_rows, fastv_k, n_tokens)
+            full_norm = self._oracle_tokens_to_normalized(full_tokens)[0]
+
+            self.language_model.pruning_info = None
+            if forced is None and (self._oracle_query_count <= warmup or k_keep >= img_len):
+                best_tokens = full_tokens[0]
+            else:
+                img_end = min(img_start + img_len, seq_len)
+                non_visual = torch.cat(
+                    (torch.arange(0, img_start, device=device), torch.arange(img_end, seq_len, device=device))
+                )
+                round_scores = []
+                round0_scores = None
+                if forced is not None:
+                    selected = sorted(int(g) for g in forced)
+                    rows = torch.cat(
+                        (non_visual, torch.tensor(selected, device=device, dtype=torch.long))
+                    ).sort().values.unsqueeze(0)
+                    toks = self._oracle_generate_batch(boundary, prefix_cache, rows, fastv_k, n_tokens)
+                    best_tokens = toks[0]
+                    round_scores.append(float(np.abs(self._oracle_tokens_to_normalized(toks)[0] - full_norm).mean()))
+                else:
+                    # Teacher-forced surrogate: score every candidate with ONE forward by
+                    # appending the full action's first n-1 tokens and comparing the expected
+                    # action of the 7 next-token distributions to the full action. The
+                    # winning keep-set is then decoded exactly (autoregressively) for execution.
+                    centers_lut = self._oracle_center_lut(device)
+                    full_norm_t = torch.tensor(full_norm, device=device, dtype=torch.float32)
+                    v_hi = int(self.vocab_size)
+                    if scoring_mode == 'exact':
+                        # Free-running scoring: greedily AR-decode each candidate keep-set
+                        # (no teacher forcing) and score by mean-L1 between its decoded
+                        # (bin-center) action and the full-patch action. Costs n_tokens
+                        # sequential forwards per chunk vs the surrogate's single forward.
+                        def surrogate_scores(rows):
+                            toks = self._oracle_generate_batch(boundary, prefix_cache, rows, fastv_k, n_tokens)
+                            norm = self._oracle_tokens_to_normalized(toks)
+                            sc = torch.tensor(np.abs(norm - full_norm[None, :]).mean(axis=1), device=device, dtype=torch.float32)
+                            return sc, None
+                    else:
+                        app_hidden = self.language_model.oracle_append_prefix(
+                            prefix_cache, full_tokens[:, : n_tokens - 1], fastv_k
+                        )
+
+                        def surrogate_scores(rows):
+                            logits = self.language_model.oracle_tail_teacher_forced(
+                                boundary, app_hidden, rows, fastv_k, seq_len
+                            )  # (N, n_tokens, V)
+                            probs = torch.softmax(logits[:, :, v_hi - 256 : v_hi], dim=-1)
+                            expected = probs @ centers_lut  # (N, n_tokens)
+                            return (expected - full_norm_t).abs().mean(dim=1), expected
+
+                    patches = torch.arange(img_start, img_end, device=device)
+                    available = torch.ones(img_end - img_start, dtype=torch.bool, device=device)
+                    pool_mask = torch.ones_like(available)
+                    pool_m = int(getattr(self, 'oracle_candidate_pool', 0))
+                    selection_mode = str(getattr(self, 'oracle_selection', 'greedy'))
+                    selected = []
+                    if selection_mode == 'topk_singleton':
+                        # Non-greedy baseline: rank all 256 patches by their SINGLETON surrogate
+                        # score and keep the k best jointly (no conditional/greedy interaction).
+                        n_p = int(patches.numel())
+                        rows = torch.cat(
+                            (non_visual.unsqueeze(0).expand(n_p, -1), patches.unsqueeze(1)), dim=1
+                        ).sort(dim=1).values
+                        scores = torch.empty(n_p, dtype=torch.float32, device=device)
+                        for s in range(0, n_p, batch_size):
+                            sc, _ = surrogate_scores(rows[s : s + batch_size])
+                            scores[s : s + sc.shape[0]] = sc
+                        round0_scores = np.full(img_len, np.nan, dtype=np.float32)
+                        round0_scores[(patches - img_start).cpu().numpy()] = scores.cpu().numpy()
+                        top = scores.topk(min(k_keep, n_p), largest=False)
+                        selected = [int(patches[i].item()) for i in top.indices]
+                        round_scores = [float(v.item()) for v in top.values]
+                        # surrogate score of the complete chosen set (recorded as surrogate gap)
+                        set_rows = torch.cat(
+                            (non_visual, torch.tensor(selected, device=device, dtype=torch.long))
+                        ).sort().values.unsqueeze(0)
+                        sc, _ = surrogate_scores(set_rows)
+                        round_scores.append(float(sc[0].item()))
+                    else:
+                        for t in range(k_keep):
+                            cands = patches[available & pool_mask]
+                            n_c = int(cands.numel())
+                            base = non_visual if not selected else torch.cat(
+                                (non_visual, torch.tensor(selected, device=device, dtype=torch.long))
+                            ).sort().values
+                            rows = torch.cat((base.unsqueeze(0).expand(n_c, -1), cands.unsqueeze(1)), dim=1).sort(dim=1).values
+                            scores = torch.empty(n_c, dtype=torch.float32, device=device)
+                            for s in range(0, n_c, batch_size):
+                                sc, _ = surrogate_scores(rows[s : s + batch_size])
+                                scores[s : s + sc.shape[0]] = sc
+                            best_i = int(scores.argmin().item())
+                            chosen = int(cands[best_i].item())
+                            selected.append(chosen)
+                            available[chosen - img_start] = False
+                            round_scores.append(float(scores[best_i].item()))
+                            if t == 0:
+                                round0_scores = np.full(img_len, np.nan, dtype=np.float32)
+                                round0_scores[(cands - img_start).cpu().numpy()] = scores.cpu().numpy()
+                                if pool_m > 0:
+                                    # Restrict later rounds to the top-M singleton candidates.
+                                    pool_mask = torch.zeros_like(available)
+                                    top = scores.topk(min(pool_m, n_c), largest=False).indices
+                                    pool_mask[(cands[top] - img_start)] = True
+                    # Exact autoregressive decode of the winning keep-set (this is what is executed).
+                    rows = torch.cat(
+                        (non_visual, torch.tensor(selected, device=device, dtype=torch.long))
+                    ).sort().values.unsqueeze(0)
+                    best_tokens = self._oracle_generate_batch(boundary, prefix_cache, rows, fastv_k, n_tokens)[0]
+                kept = torch.cat((non_visual, torch.tensor(sorted(selected), device=device, dtype=torch.long))).sort().values
+                all_idx = torch.arange(seq_len, device=device)
+                oracle_norm = self._oracle_tokens_to_normalized(best_tokens.unsqueeze(0))[0]
+                exact_gap = float(np.abs(oracle_norm - full_norm).mean())
+                self.language_model.pruning_info = {
+                    'original_seq_length': seq_len,
+                    'kept_indices': kept,
+                    'pruned_indices': all_idx[~torch.isin(all_idx, kept)],
+                    'pruning_layer': fastv_k,
+                    'mode': 'oracle',
+                    'oracle_full_action': full_norm,
+                    'oracle_action': oracle_norm,
+                    'oracle_l1_gap': exact_gap,
+                    'oracle_surrogate_gap': float(round_scores[-1]) if round_scores else float('nan'),
+                    'oracle_round_scores': np.array(round_scores, dtype=np.float32),
+                    'oracle_chosen': np.array(selected, dtype=np.int64),
+                    'oracle_round0_scores': round0_scores,
+                    'oracle_scoring': scoring_mode,
+                }
+                self._oracle_gaps.append(exact_gap)
+                if not hasattr(self, '_oracle_traces'):
+                    self._oracle_traces = []
+                self._oracle_traces.append({
+                    'query_idx': np.int64(self._oracle_query_count),
+                    'full_action': np.asarray(full_norm, dtype=np.float32),
+                    'oracle_action': np.asarray(oracle_norm, dtype=np.float32),
+                    'l1_gap': np.float32(exact_gap),
+                    'surrogate_gap': np.float32(round_scores[-1]) if round_scores else np.float32('nan'),
+                    'round_scores': np.array(round_scores, dtype=np.float32),
+                    'chosen': np.array(selected, dtype=np.int64),
+                    'round0_scores': round0_scores if round0_scores is not None else np.zeros(0, np.float32),
+                })
+            normalized_actions = self._oracle_tokens_to_normalized(best_tokens.unsqueeze(0))[0]
+
+        action_norm_stats = self.get_action_stats(unnorm_key)
+        mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
+        action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
+        actions = np.where(
+            mask,
+            0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
+            normalized_actions,
+        )
+        return actions, {"action_vision_attentions": None, "text_vision_attentions": None}
 
     def _extract_action_modality_attentions(self, attentions: List[Tuple], pruning_info: Optional[Dict] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """

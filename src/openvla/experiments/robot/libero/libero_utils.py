@@ -83,7 +83,7 @@ def save_rollout_video(rollout_images, idx, success, task_description, log_file=
     
     video_writer = imageio.get_writer(mp4_path, fps=30)
     for img in rollout_images:
-        video_writer.append_data(img)
+        video_writer.append_data(np.asarray(img))
     video_writer.close()
     print(f"Saved rollout MP4 at path {mp4_path}")
     if log_file is not None:

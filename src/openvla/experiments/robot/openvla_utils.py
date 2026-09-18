@@ -298,6 +298,23 @@ def get_vla(cfg):
         vla.use_text_vision_selection = cfg.use_text_vision_selection
         vla.use_prefil_attention = cfg.use_prefil_attention
 
+    # Oracle patch selection (greedy action-matching search); needs the pruning geometry even
+    # though use_fastv is off. Mutually exclusive with FastV/VLA-Pruner (asserted by the harness).
+    use_oracle = bool(getattr(cfg, "use_oracle_pruner", False))
+    for obj in (vla, vla.config):
+        obj.use_oracle_pruner = use_oracle
+        obj.oracle_batch_size = int(getattr(cfg, "oracle_batch_size", 64))
+        obj.oracle_warmup_queries = int(getattr(cfg, "oracle_warmup_queries", 3))
+        obj.oracle_candidate_pool = int(getattr(cfg, "oracle_candidate_pool", 0))
+        obj.oracle_selection = str(getattr(cfg, "oracle_selection", "greedy"))
+        obj.oracle_scoring = str(getattr(cfg, "oracle_scoring", "surrogate"))
+        if use_oracle:
+            obj.use_fastv = False
+            obj.fastv_k = cfg.fastv_k
+            obj.fastv_r = cfg.fastv_r
+            obj.fastv_image_token_start_index = cfg.fastv_image_token_start_index
+            obj.fastv_image_token_length = cfg.fastv_image_token_length
+
     use_temporal = getattr(cfg, 'use_temporal', getattr(cfg, 'use_temproal', False))
     temporal_w = getattr(cfg, 'temporal_w', getattr(cfg, 'temproal_w', 5))
     temporal_gamma = getattr(cfg, 'temporal_gamma', getattr(cfg, 'temproal_gamma', 0.8))
@@ -427,12 +444,32 @@ def process_image(image, crop_scale=0.9, batch_size=1):
     return image
 
 
+def compose_pruning_frame(input_img, kept_patch_ids, grid_size=16, patch_size=14, separator_px=16):
+    # separator_px=16 keeps total width (224+16+224=464) a multiple of 16 so the
+    # mp4 encoder does not resample the frame and shift the patch grid
+    """Builds a side-by-side [model input | pruned input] video frame.
+
+    The right pane blacks out every patch not in `kept_patch_ids` (patch ids in
+    [0, grid_size**2), row-major over the model-input image). `kept_patch_ids=None`
+    means no pruning happened this step, so the right pane shows the full image.
+    """
+    left = np.asarray(input_img.convert("RGB") if isinstance(input_img, Image.Image) else input_img, dtype=np.uint8)
+    right = left.copy()
+    if kept_patch_ids is not None:
+        keep = np.zeros(grid_size * grid_size, dtype=bool)
+        ids = np.asarray(kept_patch_ids, dtype=np.int64).ravel()
+        keep[ids[(ids >= 0) & (ids < keep.size)]] = True
+        mask = np.kron(keep.reshape(grid_size, grid_size), np.ones((patch_size, patch_size), dtype=bool))
+        right[~mask] = 0
+    separator = np.full((left.shape[0], separator_px, 3), 255, dtype=np.uint8)
+    return np.concatenate([left, separator, right], axis=1)
+
+
 def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_key, center_crop=False, last_caches=None):
     """Generates an action with the VLA policy."""
     image = Image.fromarray(obs["full_image"])
     image = image.convert("RGB")
-    
-    result_image = image
+
     prev_image = Image.fromarray(obs["prev_image"])
     prev_attn_a2v = last_caches['action_vision_attentions'] if last_caches is not None else None
     prev_attn_t2v = last_caches['text_vision_attentions'] if last_caches is not None else None
@@ -456,6 +493,20 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     # Process inputs
     inputs = processor(prompt, image).to(DEVICE, dtype=torch.bfloat16)
 
-    action, last_caches = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False, return_dict_in_generate=True, 
+    # Clear stale keep-set so each frame reflects this step's pruning only
+    vla.language_model.pruning_info = None
+
+    action, last_caches = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False, return_dict_in_generate=True,
                                                         output_attentions = True, past_key_values=prompt_cache)
+
+    # Visualize this step's pruning on the actual (post-crop) model input;
+    # kept_patch_ids=None (e.g. use_fastv=False) renders the full image
+    pruning_info = getattr(vla.language_model, "pruning_info", None)
+    kept_patch_ids = None
+    if pruning_info is not None and pruning_info.get("kept_indices") is not None:
+        start_idx = getattr(vla.config, "fastv_image_token_start_index", 1)
+        num_patches = getattr(vla.config, "fastv_image_token_length", 256)
+        kept = torch.as_tensor(pruning_info["kept_indices"]).detach().cpu().numpy().ravel() - start_idx
+        kept_patch_ids = kept[(kept >= 0) & (kept < num_patches)]
+    result_image = compose_pruning_frame(image, kept_patch_ids)
     return action, last_caches, result_image

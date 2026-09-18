@@ -102,6 +102,14 @@ class GenerateConfig:
     vla_pruner_av_hist_w: int = 3
     vla_pruner_av_decay: float = 0.8
 
+    # Oracle patch selection (greedy search vs full-patch action output)
+    use_oracle_pruner: bool = False                  # Greedy-optimal patch selection per query (upper bound)
+    oracle_candidate_pool: int = 0                   # 0 = pure greedy; M>0 = restrict rounds >0 to top-M singletons/view
+    oracle_batch_size: int = 128                     # Candidate keep-sets per batched tail forward
+    oracle_warmup_queries: int = 3                   # Unpruned queries per episode (mirrors VLA-Pruner warm-up)
+    save_oracle_trace: bool = True                   # Dump per-query oracle traces (actions, gaps, chosen patches)
+    oracle_trace_dir: Optional[str] = None           # Trace dir; default <local_log_dir>/oracle_trace/<run_id>
+
     #################################################################################################################
     # Model-specific parameters
     #################################################################################################################
@@ -166,6 +174,9 @@ def validate_config(cfg: GenerateConfig) -> None:
 
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
     assert not (cfg.use_fastv and cfg.use_vla_pruner), "Use either FastV baseline or VLA-Pruner, not both."
+    assert not (
+        cfg.use_oracle_pruner and (cfg.use_fastv or cfg.use_vla_pruner or cfg.use_vla_cache)
+    ), "Oracle pruner is mutually exclusive with FastV / VLA-Pruner / VLA-Cache."
     assert cfg.fastv_attention_source in {
         "prefill",
         "last",
@@ -259,7 +270,9 @@ def log_message(message: str, log_file=None):
 def log_eval_config(cfg: GenerateConfig, log_file=None) -> None:
     """Log the key settings that identify an evaluation run."""
     pruning_mode = "vanilla"
-    if cfg.use_vla_pruner:
+    if cfg.use_oracle_pruner:
+        pruning_mode = "oracle"
+    elif cfg.use_vla_pruner:
         pruning_mode = "vla_pruner"
     elif cfg.use_fastv:
         pruning_mode = "fastv"
@@ -285,6 +298,10 @@ def log_eval_config(cfg: GenerateConfig, log_file=None) -> None:
     log_message(f"  vla_pruner_av_decay: {cfg.vla_pruner_av_decay}", log_file)
     log_message(f"  merge_local_lora_adapter: {cfg.merge_local_lora_adapter}", log_file)
     log_message(f"  save_rollout_videos: {cfg.save_rollout_videos}", log_file)
+    log_message(f"  use_oracle_pruner: {cfg.use_oracle_pruner}", log_file)
+    log_message(f"  oracle_candidate_pool: {cfg.oracle_candidate_pool}", log_file)
+    log_message(f"  oracle_batch_size: {cfg.oracle_batch_size}", log_file)
+    log_message(f"  oracle_warmup_queries: {cfg.oracle_warmup_queries}", log_file)
 
 
 def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=None):
@@ -400,6 +417,7 @@ def run_episode(
     episode_task_static_tokens_primary = 0
     episode_task_static_tokens_wrist = 0
     ranking_dumps = []
+    oracle_dumps = []
 
     # Run episode
     success = False
@@ -445,6 +463,9 @@ def run_episode(
                 ranking_dump = metrics.pop("ranking_dump", None)
                 if collect_ranking and ranking_dump is not None:
                     ranking_dumps.append((episode_step, t, ranking_dump))
+                oracle_dump = metrics.pop("oracle_dump", None)
+                if oracle_dump is not None:
+                    oracle_dumps.append((episode_step, t, oracle_dump))
                 
                 action_queue.extend(actions)
                 # result_image is a single [input|pruned|input|pruned] frame across views
@@ -477,6 +498,7 @@ def run_episode(
         "episode_task_static_tokens_primary": episode_task_static_tokens_primary,
         "episode_task_static_tokens_wrist": episode_task_static_tokens_wrist,
         "ranking_dumps": ranking_dumps,
+        "oracle_dumps": oracle_dumps,
     }
 
     return success, replay_images_heatmap, replay_images_wrist_heatmap, eposode_metrics
@@ -506,6 +528,39 @@ def save_ranking_dumps(cfg, dumps, task_id, task_description, episode_num, succe
             **dump,
         )
     log_message(f"Saved {len(dumps)} ranking dumps to {ep_dir}", log_file)
+
+
+def save_oracle_dumps(cfg, dumps, task_id, task_description, episode_num, success, log_file=None):
+    """Writes one npz per model query with the oracle greedy-search trace of that step."""
+    label = "success" if success else "failure"
+    ep_dir = os.path.join(cfg.oracle_trace_dir, f"ep{episode_num:03d}_task{task_id:02d}_{label}")
+    os.makedirs(ep_dir, exist_ok=True)
+    with open(os.path.join(ep_dir, "meta.json"), "w") as f:
+        json.dump(
+            {
+                "task_id": task_id,
+                "task_description": task_description,
+                "episode": episode_num,
+                "success": bool(success),
+            },
+            f,
+            indent=2,
+        )
+    for query_idx, env_step, dump in dumps:
+        arrays = {}
+        for key, value in dump.items():
+            if key == "kept_per_view":
+                for view_idx, kept in enumerate(value):
+                    arrays[f"kept_view{view_idx}"] = np.asarray(kept)
+            elif value is not None:
+                arrays[key] = np.asarray(value)
+        np.savez_compressed(
+            os.path.join(ep_dir, f"step{env_step:03d}.npz"),
+            query_idx=np.int64(query_idx),
+            env_step=np.int64(env_step),
+            **arrays,
+        )
+    log_message(f"Saved {len(dumps)} oracle traces to {ep_dir}", log_file)
 
 
 def run_task(
@@ -604,6 +659,17 @@ def run_task(
                 log_file,
             )
 
+        if eposode_metrics.get("oracle_dumps"):
+            save_oracle_dumps(
+                cfg,
+                eposode_metrics["oracle_dumps"],
+                task_id,
+                task_description,
+                total_episodes,
+                success,
+                log_file,
+            )
+
         if cfg.save_rollout_videos:
             save_rollout_video(
                 replay_images,
@@ -670,6 +736,9 @@ def eval_libero(cfg: GenerateConfig) -> float:
 
     if cfg.save_ranking_viz and cfg.ranking_viz_dir is None:
         cfg.ranking_viz_dir = os.path.join(cfg.local_log_dir, "ranking_viz", run_id)
+
+    if cfg.use_oracle_pruner and cfg.save_oracle_trace and cfg.oracle_trace_dir is None:
+        cfg.oracle_trace_dir = os.path.join(cfg.local_log_dir, "oracle_trace", run_id)
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()

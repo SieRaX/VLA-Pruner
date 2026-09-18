@@ -1001,6 +1001,26 @@ class LlamaModel(LlamaPreTrainedModel):
                 "mode": "none",
             }
 
+        forced = fastv_config.get("forced_visual_indices", None)
+        if forced is not None:
+            forced_t = torch.as_tensor(forced, device=device, dtype=torch.long).reshape(-1)
+            forced_t = forced_t.clamp(image_start, image_end - 1).unique(sorted=True)
+            keep_indices = torch.cat(
+                (
+                    torch.arange(image_start, device=device),
+                    forced_t,
+                    torch.arange(image_end, seq_length, device=device),
+                )
+            ).sort().values
+            return keep_indices, {
+                "image_token_start_index": image_start,
+                "image_token_length": image_len,
+                "num_keep": int(forced_t.numel()),
+                "kept_visual_tokens": int(forced_t.numel()),
+                "mode": "forced",
+                "image_spans": image_spans,
+            }
+
         prune_ratio = float(fastv_config.get("fastv_r", 0.5))
         num_keep = int(round(image_len * (1.0 - prune_ratio)))
         num_keep = max(0, min(image_len, num_keep))
@@ -1260,7 +1280,11 @@ class LlamaModel(LlamaPreTrainedModel):
         prune_ratio = float(fastv_config.get("fastv_r", 0.5))
         pruning_flops_debug = os.environ.get("OPENVLA_PRUNING_FLOPS", "0").lower() in {"1", "true", "yes"}
         pruning_report_once = os.environ.get("OPENVLA_PRUNING_REPORT_ONCE", "0").lower() in {"1", "true", "yes"}
-        if image_len > 0 and int(round(image_len * (1.0 - prune_ratio))) >= image_len:
+        if (
+            image_len > 0
+            and int(round(image_len * (1.0 - prune_ratio))) >= image_len
+            and fastv_config.get("forced_visual_indices") is None
+        ):
             if pruning_flops_debug:
                 seq_len = 0
                 if inputs_embeds is not None:
@@ -1468,6 +1492,44 @@ class LlamaModel(LlamaPreTrainedModel):
         )
         output.pruning_info = pruning_info
         return output
+
+    def oracle_tail_forward(
+        self,
+        boundary_hidden: torch.Tensor,
+        keep_indices: torch.Tensor,
+        start_layer: int,
+    ) -> torch.Tensor:
+        """Run decoder layers [start_layer:] on N pruned copies of a cached boundary hidden
+        state (oracle patch-selection search). `boundary_hidden` is (1, L0, D) — the output of
+        layer `start_layer - 1` from a dense forward; `keep_indices` is (N, L) long with each
+        row sorted ascending (compacted causality then equals original causality, matching the
+        mask fastv_forward builds after pruning). Returns final-norm hidden states (N, L, D).
+        """
+        n_cand, keep_len = keep_indices.shape
+        device = boundary_hidden.device
+        hidden_states = boundary_hidden[0].index_select(0, keep_indices.reshape(-1)).reshape(
+            n_cand, keep_len, boundary_hidden.shape[-1]
+        )
+        # Original absolute positions for RoPE, per candidate. The mask must be built exactly
+        # as fastv_forward builds its post-pruning mask (OpenVLA-OFT attends bidirectionally,
+        # so under sdpa this returns None -> unmasked eager attention; a causal mask here
+        # would diverge from the fastv pruned path). output_attentions=True forces the same
+        # eager attention path as fastv_forward so outputs are directly comparable.
+        position_ids = keep_indices
+        cache_position = torch.arange(keep_len, device=device)
+        causal_mask = self._update_causal_mask(None, hidden_states, cache_position, 0, False)
+        for decoder_layer in self.layers[start_layer:]:
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=None,
+                output_attentions=True,
+                use_cache=False,
+                cache_position=cache_position,
+            )
+            hidden_states = layer_outputs[0]
+        return self.norm(hidden_states)
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     def forward(
@@ -1813,6 +1875,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         if hasattr(self.model, "pruning_info"):
             self.pruning_info = self.model.pruning_info
         return output
+
+    def oracle_tail_forward(self, boundary_hidden, keep_indices, start_layer):
+        return self.model.oracle_tail_forward(boundary_hidden, keep_indices, start_layer)
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)

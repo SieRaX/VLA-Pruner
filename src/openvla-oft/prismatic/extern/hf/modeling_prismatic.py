@@ -754,6 +754,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
     def reset_av_history(self):
         self.av_hist.clear()
+        self._oracle_query_count = 0
 
     def _prepare_input_for_action_prediction(self, input_ids, attention_mask):
         """Prepares input for action prediction by adding necessary tokens"""
@@ -963,6 +964,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             "action_horizon": int(getattr(self, "vla_pruner_action_horizon", 0)),
             "action_dim": int(token_metadata.get("action_dim", ACTION_DIM)),
             "return_attentions": bool(getattr(self, "return_attentions_for_cache", False) or use_temporal),
+            "forced_visual_indices": getattr(self, "fastv_forced_visual_indices", None),
         }
 
     def _run_diffusion_prediction(
@@ -1048,10 +1050,184 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         # Return final actions
         return curr_noisy_actions.float().cpu().detach().numpy(), actions_hidden_states
-    
 
-        
-        
+    def _oracle_regression_prediction(
+        self,
+        multimodal_embeddings,
+        multimodal_attention_mask,
+        action_head,
+        token_metadata,
+    ):
+        """Oracle patch selection: greedy search for the k visual patches per view whose
+        pruned-input action chunk best matches the full-input action chunk (mean L1 in
+        normalized action space). The executed action is the pruned-input prediction of the
+        winning patch set — an upper bound on what any selection criterion can achieve at
+        this retention. Layers [0, fastv_k] are candidate-independent, so they run once and
+        candidates only re-run the tail layers on the pruned sequence (oracle_tail_forward)."""
+        if token_metadata is None:
+            raise ValueError("Oracle pruner requires OpenVLA-OFT token metadata.")
+        device = multimodal_embeddings.device
+        fastv_k = int(getattr(self, "fastv_k", 3))
+        fastv_r = float(getattr(self, "fastv_r", 0.5))
+        per_view = int(token_metadata["num_patches_per_image"])
+        num_views = int(token_metadata["num_images"])
+        k_per_view = max(0, min(per_view, int(round(per_view * (1.0 - fastv_r)))))
+        warmup = int(getattr(self, "oracle_warmup_queries", 3))
+        batch_size = max(1, int(getattr(self, "oracle_batch_size", 128)))
+        pool_m = int(getattr(self, "oracle_candidate_pool", 0))
+        act_len = ACTION_DIM * NUM_ACTIONS_CHUNK
+
+        self._oracle_query_count = int(getattr(self, "_oracle_query_count", 0)) + 1
+
+        with torch.no_grad():
+            out = self.language_model(
+                input_ids=None,
+                attention_mask=multimodal_attention_mask,
+                position_ids=None,
+                past_key_values=None,
+                inputs_embeds=multimodal_embeddings,
+                labels=None,
+                use_cache=False,
+                output_attentions=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            full_actions_hidden = out.hidden_states[-1][:, -act_len - 1 : -1, :]
+            a_full = action_head.predict_action(full_actions_hidden).reshape(
+                1, NUM_ACTIONS_CHUNK, ACTION_DIM
+            )
+            a_full_f32 = a_full.float()
+
+            last_caches = {
+                "past_key_values": None,
+                "attentions": None,
+                "token_metadata": token_metadata,
+                "pruning_info": None,
+            }
+
+            forced = getattr(self, "_oracle_forced_keepset", None)
+            if forced is None and (self._oracle_query_count <= warmup or k_per_view >= per_view):
+                normalized = a_full.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM).float().cpu().detach().numpy()
+                return normalized, full_actions_hidden, last_caches
+
+            seq_len = multimodal_embeddings.shape[1]
+            visual_start = int(token_metadata["visual_token_start"])
+            visual_end = int(token_metadata["visual_token_end"])
+            # hidden_states[i] is the input of layer i, so index fastv_k+1 is the output of
+            # layer fastv_k — the exact tensor fastv_forward prunes.
+            boundary = out.hidden_states[fastv_k + 1]
+            non_visual = torch.cat(
+                (
+                    torch.arange(0, visual_start, device=device),
+                    torch.arange(visual_end, seq_len, device=device),
+                )
+            )
+
+            def _tail_actions(keep_rows):
+                tail = self.language_model.oracle_tail_forward(boundary, keep_rows, fastv_k + 1)
+                cand_hidden = tail[:, -act_len - 1 : -1, :]
+                return action_head.predict_action(cand_hidden).reshape(
+                    keep_rows.shape[0], NUM_ACTIONS_CHUNK, ACTION_DIM
+                ).float()
+
+            if forced is not None:
+                forced_t = torch.as_tensor(forced, device=device, dtype=torch.long).reshape(-1)
+                keep = torch.cat((non_visual, forced_t)).sort().values.unsqueeze(0)
+                a_c = _tail_actions(keep)
+                selected_t = forced_t.sort().values
+                best_action = a_c[0]
+                round_scores = [float((a_c - a_full_f32).abs().mean().item())]
+                chosen_order = selected_t.cpu().numpy()
+                chosen_views = ((selected_t - visual_start) // per_view).cpu().numpy()
+                round0_scores = None
+            else:
+                num_patches = per_view * num_views
+                patch_global = torch.arange(visual_start, visual_start + num_patches, device=device)
+                view_ids = torch.arange(num_patches, device=device) // per_view
+                available = torch.ones(num_patches, dtype=torch.bool, device=device)
+                pool_mask = torch.ones(num_patches, dtype=torch.bool, device=device)
+                counts = [0] * num_views
+                selected = []
+                round_scores = []
+                round0_scores = None
+                best_action = None
+
+                for t in range(k_per_view * num_views):
+                    cand_mask = available & pool_mask
+                    for v in range(num_views):
+                        if counts[v] >= k_per_view:
+                            cand_mask &= view_ids != v
+                    cands = patch_global[cand_mask]
+                    n_c = int(cands.numel())
+                    if selected:
+                        base = torch.cat(
+                            (non_visual, torch.tensor(selected, device=device, dtype=torch.long))
+                        ).sort().values
+                    else:
+                        base = non_visual.sort().values
+                    keep_rows = torch.cat(
+                        (base.unsqueeze(0).expand(n_c, -1), cands.unsqueeze(1)), dim=1
+                    ).sort(dim=1).values
+                    scores = torch.empty(n_c, dtype=torch.float32, device=device)
+                    actions_buf = torch.empty(
+                        n_c, NUM_ACTIONS_CHUNK, ACTION_DIM, dtype=torch.float32, device=device
+                    )
+                    for s in range(0, n_c, batch_size):
+                        a_c = _tail_actions(keep_rows[s : s + batch_size])
+                        actions_buf[s : s + a_c.shape[0]] = a_c
+                        scores[s : s + a_c.shape[0]] = (a_c - a_full_f32).abs().mean(dim=(1, 2))
+                    best_i = int(scores.argmin().item())
+                    chosen = int(cands[best_i].item())
+                    selected.append(chosen)
+                    counts[int((chosen - visual_start) // per_view)] += 1
+                    available[chosen - visual_start] = False
+                    best_action = actions_buf[best_i]
+                    round_scores.append(float(scores[best_i].item()))
+                    if t == 0:
+                        full_scores = torch.full((num_patches,), float("nan"), dtype=torch.float32)
+                        full_scores[(cands - visual_start).cpu()] = scores.cpu()
+                        round0_scores = full_scores.numpy()
+                        if pool_m > 0:
+                            pool_mask = torch.zeros(num_patches, dtype=torch.bool, device=device)
+                            for v in range(num_views):
+                                view_scores = scores[view_ids[cand_mask] == v]
+                                view_cands = cands[view_ids[cand_mask] == v]
+                                top = view_scores.topk(min(pool_m, int(view_cands.numel())), largest=False).indices
+                                pool_mask[view_cands[top] - visual_start] = True
+                            pool_mask[torch.tensor(selected, device=device) - visual_start] = True
+
+                selected_t = torch.tensor(sorted(selected), device=device, dtype=torch.long)
+                chosen_order = np.array(selected, dtype=np.int64)
+                chosen_views = np.array([(g - visual_start) // per_view for g in selected])
+
+            kept_indices = torch.cat((non_visual, selected_t)).sort().values
+            all_indices = torch.arange(seq_len, device=device)
+            pruned_indices = all_indices[~torch.isin(all_indices, kept_indices)]
+            last_caches["pruning_info"] = {
+                "original_seq_length": seq_len,
+                "kept_indices": kept_indices,
+                "pruned_indices": pruned_indices,
+                "pruning_layer": fastv_k,
+                "mode": "oracle",
+                "image_token_start_index": visual_start,
+                "image_token_length": visual_end - visual_start,
+                "num_keep": k_per_view,
+                "kept_visual_tokens": int(selected_t.numel()),
+                "image_spans": [
+                    (visual_start + v * per_view, visual_start + (v + 1) * per_view, k_per_view)
+                    for v in range(num_views)
+                ],
+                "oracle_full_action": a_full_f32.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM).cpu().numpy(),
+                "oracle_action": best_action.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM).cpu().numpy(),
+                "oracle_l1_gap": round_scores[-1],
+                "oracle_round_scores": np.array(round_scores, dtype=np.float32),
+                "oracle_chosen": chosen_order,
+                "oracle_chosen_view": chosen_views,
+                "oracle_round0_scores": round0_scores,
+            }
+            normalized = best_action.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM).cpu().numpy()
+            return normalized, full_actions_hidden, last_caches
+
     def _regression_or_discrete_prediction(
         self,
         input_embeddings,
@@ -1075,6 +1251,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             input_embeddings, projected_patch_embeddings, attention_mask
         )
         
+        if bool(getattr(self, "use_oracle_pruner", False)) and action_head is not None:
+            return self._oracle_regression_prediction(
+                multimodal_embeddings, multimodal_attention_mask, action_head, token_metadata
+            )
+
         use_attention_pruning = bool(getattr(self, "use_fastv", False) or getattr(self, "use_vla_pruner", False))
         need_attentions = True
         if use_attention_pruning:

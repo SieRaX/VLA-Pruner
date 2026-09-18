@@ -1099,7 +1099,13 @@ class LlamaModel(LlamaPreTrainedModel):
                         last_layer_attention_avg_last_tok_image = last_layer_attention_avg_last_tok[FASTV_image_token_start_index:FASTV_image_token_start_index+FASTV_image_token_length]
                         num_keep = round(FASTV_image_token_length * (1 - FASTV_r))
 
-                        if use_temporal and Temporal_Guide is not None:
+                        forced_visual = fastv_config.get('forced_visual_indices', None)
+                        if forced_visual is not None:
+                            # Oracle equivalence testing: replay an externally chosen keep-set.
+                            top_attention_rank_index = torch.as_tensor(
+                                forced_visual, device=device, dtype=torch.long
+                            ).reshape(-1).sort().values
+                        elif use_temporal and Temporal_Guide is not None:
                             # VLA-Pruner: Temporal-guided Token Pruning
                             
                             # (1) Dual-level Top-K Selection
@@ -1229,6 +1235,147 @@ class LlamaModel(LlamaPreTrainedModel):
         self.pruning_info = pruning_info
         
         return output
+
+    # ---- Oracle patch selection (greedy action-matching search) -------------------------
+    # NOTE: every runner below passes output_attentions=True (weights discarded). The repo's
+    # fastv_forward / cached generation always request attention weights, which routes this
+    # fork's attention through the eager kernel; without it the sdpa kernel is used and logits
+    # drift by ~0.5 (enough to flip near-tie action tokens). Verified bit-exact with it.
+    # fastv_forward prunes the INPUT of layer fastv_k (using layer fastv_k-1 attention), so the
+    # dense prefix is layers [0, fastv_k) and every candidate keep-set re-runs layers
+    # [fastv_k:] plus the autoregressive action decode.  The mixed-length KV cache (dense
+    # prefix layers, pruned tail layers) and the mask/position handling below replicate the
+    # fastv_forward + cached-generation path exactly (validated by test_oracle_equivalence.py).
+    def oracle_prefix_forward(self, inputs_embeds, attention_mask, split_layer):
+        """Dense layers [0, split_layer) with a fresh KV cache (batch 1). Returns the hidden
+        state entering `split_layer` (the tensor fastv_forward prunes) and the prefix cache."""
+        cache = DynamicCache()
+        seq_len = inputs_embeds.shape[1]
+        cache_position = torch.arange(seq_len, device=inputs_embeds.device)
+        position_ids = cache_position.unsqueeze(0)
+        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, 0)
+        hidden_states = inputs_embeds
+        for decoder_layer in self.layers[:split_layer]:
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=cache,
+                output_attentions=True,
+                use_cache=True,
+                cache_position=cache_position,
+            )[0]
+        return hidden_states, cache
+
+    def oracle_tail_prefill(self, boundary_hidden, prefix_cache, keep_rows, split_layer):
+        """Batched pruned prefill of layers [split_layer:] for N candidate keep-sets `keep_rows`
+        (N, L), each row sorted ascending (original positions, used for RoPE). Layers below
+        `split_layer` reuse the dense prefix cache expanded over the batch. Returns the
+        final-norm hidden state of the last token (N, D) and the per-candidate cache."""
+        n_cand, keep_len = keep_rows.shape
+        device = boundary_hidden.device
+        hidden_states = boundary_hidden[0].index_select(0, keep_rows.reshape(-1)).reshape(
+            n_cand, keep_len, boundary_hidden.shape[-1]
+        )
+        cache = DynamicCache()
+        for layer_idx in range(split_layer):
+            cache.key_cache.append(prefix_cache.key_cache[layer_idx].expand(n_cand, -1, -1, -1))
+            cache.value_cache.append(prefix_cache.value_cache[layer_idx].expand(n_cand, -1, -1, -1))
+        cache._seen_tokens = prefix_cache.get_seq_length()
+        position_ids = keep_rows
+        cache_position = torch.arange(keep_len, device=device)
+        pruned_mask = self._update_causal_mask(None, boundary_hidden, 0)
+        for decoder_layer in self.layers[split_layer:]:
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=pruned_mask,
+                position_ids=position_ids,
+                past_key_value=cache,
+                output_attentions=True,
+                use_cache=True,
+                cache_position=cache_position,
+            )[0]
+        return self.norm(hidden_states[:, -1, :]), cache
+
+    def oracle_append_prefix(self, prefix_cache, token_ids, split_layer):
+        """Teacher forcing: run `token_ids` (1, A) through the dense layers [0, split_layer)
+        attending the dense prefix cache at positions L0.. (exactly where cached generation
+        would place them), WITHOUT mutating `prefix_cache` (a shallow-copied cache receives the
+        concatenated K/V). Returns the hidden state entering `split_layer`, (1, A, D) — the
+        candidate-independent part of the appended tokens' computation."""
+        inputs_embeds = self.embed_tokens(token_ids)
+        past_seen = prefix_cache.get_seq_length()
+        n_app = inputs_embeds.shape[1]
+        tmp = DynamicCache()
+        tmp.key_cache = list(prefix_cache.key_cache)
+        tmp.value_cache = list(prefix_cache.value_cache)
+        tmp._seen_tokens = past_seen
+        cache_position = torch.arange(past_seen, past_seen + n_app, device=inputs_embeds.device)
+        position_ids = cache_position.unsqueeze(0)
+        causal_mask = self._update_causal_mask(None, inputs_embeds, past_seen)
+        hidden_states = inputs_embeds
+        for decoder_layer in self.layers[:split_layer]:
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=tmp,
+                output_attentions=True,
+                use_cache=True,
+                cache_position=cache_position,
+            )[0]
+        return hidden_states
+
+    def oracle_tail_teacher_forced(self, boundary_hidden, appended_hidden, keep_rows, split_layer, dense_len):
+        """Single batched forward of layers [split_layer:] over [candidate keep-set rows ;
+        A appended teacher-forced action tokens], no KV cache. `keep_rows` (N, L) sorted
+        ascending (original positions for RoPE); appended tokens take positions
+        dense_len..dense_len+A-1 as in cached generation. Returns the final-norm hidden state
+        of the last prompt token and the A appended positions, (N, A+1, D) — the A+1
+        next-action-token predictors."""
+        n_cand, keep_len = keep_rows.shape
+        n_app = appended_hidden.shape[1]
+        device = boundary_hidden.device
+        h_keep = boundary_hidden[0].index_select(0, keep_rows.reshape(-1)).reshape(
+            n_cand, keep_len, boundary_hidden.shape[-1]
+        )
+        hidden_states = torch.cat((h_keep, appended_hidden.expand(n_cand, -1, -1)), dim=1)
+        app_pos = torch.arange(dense_len, dense_len + n_app, device=device).unsqueeze(0).expand(n_cand, -1)
+        position_ids = torch.cat((keep_rows, app_pos), dim=1)
+        cache_position = torch.arange(keep_len + n_app, device=device)
+        causal_mask = self._update_causal_mask(None, boundary_hidden, 0)
+        for decoder_layer in self.layers[split_layer:]:
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=None,
+                output_attentions=True,
+                use_cache=False,
+                cache_position=cache_position,
+            )[0]
+        return self.norm(hidden_states[:, keep_len - 1 :, :])
+
+    def oracle_decode_step(self, input_ids, cache):
+        """One cached decode step for a batch of candidates (`input_ids` (N, 1)); mirrors the
+        cached-generation path: attention_mask=None, position = layer-0 cache length."""
+        inputs_embeds = self.embed_tokens(input_ids)
+        past_seen = cache.get_seq_length()
+        cache_position = torch.arange(past_seen, past_seen + 1, device=inputs_embeds.device)
+        position_ids = cache_position.unsqueeze(0).expand(inputs_embeds.shape[0], -1)
+        causal_mask = self._update_causal_mask(None, inputs_embeds, past_seen)
+        hidden_states = inputs_embeds
+        for decoder_layer in self.layers:
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=cache,
+                output_attentions=True,
+                use_cache=True,
+                cache_position=cache_position,
+            )[0]
+        return self.norm(hidden_states[:, -1, :])
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     def forward(
@@ -1540,6 +1687,23 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             self.pruning_info = self.model.pruning_info
         
         return causal_output
+
+    def oracle_prefix_forward(self, inputs_embeds, attention_mask, split_layer):
+        return self.model.oracle_prefix_forward(inputs_embeds, attention_mask, split_layer)
+
+    def oracle_tail_prefill(self, boundary_hidden, prefix_cache, keep_rows, split_layer):
+        hidden, cache = self.model.oracle_tail_prefill(boundary_hidden, prefix_cache, keep_rows, split_layer)
+        return self.lm_head(hidden).float(), cache
+
+    def oracle_decode_step(self, input_ids, cache):
+        return self.lm_head(self.model.oracle_decode_step(input_ids, cache)).float()
+
+    def oracle_append_prefix(self, prefix_cache, token_ids, split_layer):
+        return self.model.oracle_append_prefix(prefix_cache, token_ids, split_layer)
+
+    def oracle_tail_teacher_forced(self, boundary_hidden, appended_hidden, keep_rows, split_layer, dense_len):
+        hidden = self.model.oracle_tail_teacher_forced(boundary_hidden, appended_hidden, keep_rows, split_layer, dense_len)
+        return self.lm_head(hidden).float()
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
