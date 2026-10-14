@@ -1051,6 +1051,91 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Return final actions
         return curr_noisy_actions.float().cpu().detach().numpy(), actions_hidden_states
 
+    def _conditional_patch_utility_tables(self, boundary, a_full_f32, action_head, token_metadata, request):
+        """Brute-force action-preservation tables for one query (conditional patch utility study).
+
+        Uses the oracle evaluator unchanged (layers [0, fastv_k] dense, tail layers on the pruned
+        sequence, non-visual tokens always kept) and evaluates: no visual patch, every single
+        patch, every unordered patch pair over all views, and any extra keep-sets in
+        request["extra_sets"] (patch ids relative to the first visual token). Errors are MSE / L1
+        to A_full in normalized action space. Every tail forward uses the same batch shape
+        (last batch padded) so bf16 batch-shape noise is constant within a table."""
+        device = boundary.device
+        fastv_k = int(getattr(self, "fastv_k", 3))
+        act_len = ACTION_DIM * NUM_ACTIONS_CHUNK
+        seq_len = boundary.shape[1]
+        visual_start = int(token_metadata["visual_token_start"])
+        visual_end = int(token_metadata["visual_token_end"])
+        num_patches = visual_end - visual_start
+        batch_size = max(1, int(request.get("batch_size", 512)))
+        prefix = torch.arange(0, visual_start, device=device)
+        suffix = torch.arange(visual_end, seq_len, device=device)
+
+        def _evaluate(patch_sets):
+            """patch_sets: (N, m) long, rows ascending, relative patch ids. -> actions (N, T, D) fp32."""
+            n = patch_sets.shape[0]
+            actions = torch.empty(n, NUM_ACTIONS_CHUNK, ACTION_DIM, dtype=torch.float32, device=device)
+            for s in range(0, n, batch_size):
+                chunk = patch_sets[s : s + batch_size]
+                real = chunk.shape[0]
+                if real < batch_size and n > batch_size:
+                    chunk = torch.cat((chunk, chunk[-1:].expand(batch_size - real, -1)), dim=0)
+                keep_rows = torch.cat(
+                    (
+                        prefix.unsqueeze(0).expand(chunk.shape[0], -1),
+                        chunk + visual_start,
+                        suffix.unsqueeze(0).expand(chunk.shape[0], -1),
+                    ),
+                    dim=1,
+                )
+                tail = self.language_model.oracle_tail_forward(boundary, keep_rows, fastv_k + 1)
+                a_c = action_head.predict_action(tail[:, -act_len - 1 : -1, :]).reshape(
+                    chunk.shape[0], NUM_ACTIONS_CHUNK, ACTION_DIM
+                )
+                actions[s : s + real] = a_c[:real].float()
+            return actions
+
+        def _errors(actions):
+            diff = actions - a_full_f32
+            return diff.pow(2).mean(dim=(1, 2)), diff.abs().mean(dim=(1, 2))
+
+        result = {"num_patches": num_patches, "a_full": a_full_f32[0].cpu().numpy()}
+        a_none = _evaluate(torch.empty(1, 0, dtype=torch.long, device=device))
+        mse, l1 = _errors(a_none)
+        result.update(a_none=a_none[0].cpu().numpy(), mse_none=float(mse[0]), l1_none=float(l1[0]))
+
+        singles = torch.arange(num_patches, device=device).unsqueeze(1)
+        a_single = _evaluate(singles)
+        mse, l1 = _errors(a_single)
+        result.update(
+            a_single=a_single.half().cpu().numpy(), mse_single=mse.cpu().numpy(), l1_single=l1.cpu().numpy()
+        )
+
+        if bool(request.get("pairs", True)):
+            pair_idx = torch.triu_indices(num_patches, num_patches, offset=1, device=device).t().contiguous()
+            a_pair = _evaluate(pair_idx)
+            mse, l1 = _errors(a_pair)
+            result.update(
+                pair_idx=pair_idx.to(torch.int16).cpu().numpy(),
+                a_pair=a_pair.half().cpu().numpy(),
+                mse_pair=mse.cpu().numpy(),
+                l1_pair=l1.cpu().numpy(),
+            )
+
+        extra = {}
+        for name, patch_ids in (request.get("extra_sets") or {}).items():
+            ids = torch.as_tensor(sorted(int(p) for p in patch_ids), device=device, dtype=torch.long).unsqueeze(0)
+            a_e = _evaluate(ids)
+            mse, l1 = _errors(a_e)
+            extra[name] = {
+                "patches": ids[0].cpu().numpy(),
+                "action": a_e[0].cpu().numpy(),
+                "mse": float(mse[0]),
+                "l1": float(l1[0]),
+            }
+        result["extra"] = extra
+        return result
+
     def _oracle_regression_prediction(
         self,
         multimodal_embeddings,
@@ -1104,6 +1189,17 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 "token_metadata": token_metadata,
                 "pruning_info": None,
             }
+
+            if bool(getattr(self, "_cpu_mode", False)):
+                # Conditional-patch-utility analysis: the rollout stays dense (A_full is executed);
+                # the brute-force tables are computed only on queries the harness requests.
+                request = getattr(self, "_cpu_request", None)
+                if request is not None:
+                    last_caches["cpu_analysis"] = self._conditional_patch_utility_tables(
+                        out.hidden_states[fastv_k + 1], a_full_f32, action_head, token_metadata, request
+                    )
+                normalized = a_full.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM).float().cpu().detach().numpy()
+                return normalized, full_actions_hidden, last_caches
 
             forced = getattr(self, "_oracle_forced_keepset", None)
             if forced is None and (self._oracle_query_count <= warmup or k_per_view >= per_view):
